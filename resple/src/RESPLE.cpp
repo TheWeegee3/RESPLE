@@ -1,6 +1,8 @@
 #include <rclcpp/rclcpp.hpp>
 #include <rclcpp_components/register_node_macro.hpp>
 #include <rclcpp/executors/multi_threaded_executor.hpp>
+#include <rclcpp_lifecycle/lifecycle_node.hpp>
+#include <lifecycle_msgs/msg/transition.hpp>
 #include <std_msgs/msg/int64.hpp>
 #include <std_msgs/msg/bool.hpp>
 #include <sensor_msgs/msg/imu.hpp>
@@ -12,10 +14,16 @@
 #include <visualization_msgs/msg/marker_array.hpp>
 #include <geometry_msgs/msg/point.hpp>
 #include <tf2_ros/transform_broadcaster.h>
+#include <diagnostic_updater/diagnostic_updater.hpp>
+#include <diagnostic_updater/publisher.hpp>
+#include <rclcpp_action/rclcpp_action.hpp>
 #include <pcl_conversions/pcl_conversions.h>
+#include <pcl/io/pcd_io.h>
 #include <queue>
 #include <thread>
 #include <mutex>
+#include <chrono>
+#include <atomic>
 #include <boost/make_shared.hpp>
 #include <rclcpp/service.hpp>
 #include <std_srvs/srv/empty.hpp>
@@ -28,23 +36,59 @@
 #include "estimate_msgs/msg/calib.hpp"
 #include "estimate_msgs/msg/spline.hpp"
 #include "estimate_msgs/msg/estimate.hpp"
+#include "estimate_msgs/action/save_map.hpp"
 #include "Estimator.h"
 
 KD_TREE<pcl::PointXYZINormal> ikdtree;
 
-class RESPLE : public rclcpp::Node
+class RESPLE : public rclcpp_lifecycle::LifecycleNode
 {
 
 public:
     explicit RESPLE(const rclcpp::NodeOptions& options = rclcpp::NodeOptions())
-        : rclcpp::Node("RESPLE", options)
+        : rclcpp_lifecycle::LifecycleNode("RESPLE", 
+          rclcpp::NodeOptions(options).use_intra_process_comms(true)),
+          diagnostics_(this),
+          processing_active_(false)
     {
-        // Parameterize thread count and nearest neighbor count
-        num_threads_ = this->declare_parameter<int>("num_threads", 5);
-        num_match_points_ = this->declare_parameter<int>("num_match_points", 5);
+        RCLCPP_INFO(this->get_logger(), "RESPLE LifecycleNode created (unconfigured state)");
+    }
+    
+    // Phase 4: Lifecycle callbacks
+    rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn
+    on_configure(const rclcpp_lifecycle::State&)
+    {
+        RCLCPP_INFO(this->get_logger(), "Configuring RESPLE...");
+        
+        // Phase 4: Parameter validation with constraints
+        auto num_threads_desc = rcl_interfaces::msg::ParameterDescriptor{};
+        num_threads_desc.description = "Number of OpenMP threads for parallel processing";
+        num_threads_desc.integer_range.resize(1);
+        num_threads_desc.integer_range[0].from_value = 1;
+        num_threads_desc.integer_range[0].to_value = 16;
+        num_threads_desc.integer_range[0].step = 1;
+        num_threads_ = this->declare_parameter<int>("num_threads", 5, num_threads_desc);
+        
+        auto num_match_points_desc = rcl_interfaces::msg::ParameterDescriptor{};
+        num_match_points_desc.description = "Number of nearest neighbor points for matching";
+        num_match_points_desc.integer_range.resize(1);
+        num_match_points_desc.integer_range[0].from_value = 3;
+        num_match_points_desc.integer_range[0].to_value = 10;
+        num_match_points_desc.integer_range[0].step = 1;
+        num_match_points_ = this->declare_parameter<int>("num_match_points", 5, num_match_points_desc);
         
         RCLCPP_INFO(this->get_logger(), "Using %d threads for parallel processing", num_threads_);
         RCLCPP_INFO(this->get_logger(), "Using %d nearest neighbor points for matching", num_match_points_);
+        
+        // Phase 4: Setup diagnostics
+        diagnostics_.setHardwareID("RESPLE");
+        diagnostics_.add("System Health", this, &RESPLE::updateDiagnostics);
+        
+        // Initialize diagnostic metrics
+        last_process_time_ = this->now();
+        frame_count_ = 0;
+        total_computation_time_ms_ = 0.0;
+        total_iekf_iterations_ = 0;
         
         readParameters();
         
@@ -52,10 +96,39 @@ public:
         sensor_cb_group = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
         control_cb_group = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
         
+        // Create publishers (inactive until activated)
+        pub_est = this->create_publisher<estimate_msgs::msg::Estimate>("est_window", rclcpp::QoS(50).reliable());
+        pub_start_time = this->create_publisher<std_msgs::msg::Int64>("start_time", rclcpp::QoS(50).reliable());
+        pub_pose = this->create_publisher<geometry_msgs::msg::PoseStamped>("pose", rclcpp::QoS(50).reliable());
+        pub_cur_scan = this->create_publisher<sensor_msgs::msg::PointCloud2>("current_scan", rclcpp::QoS(2).reliable());
+        br = std::make_shared<tf2_ros::TransformBroadcaster>(*this);
+        
+        // Phase 4: Create SaveMap action server
+        save_map_action_server_ = rclcpp_action::create_server<estimate_msgs::action::SaveMap>(
+            this,
+            "save_map",
+            std::bind(&RESPLE::handleSaveMapGoal, this, std::placeholders::_1, std::placeholders::_2),
+            std::bind(&RESPLE::handleSaveMapCancel, this, std::placeholders::_1),
+            std::bind(&RESPLE::handleSaveMapAccepted, this, std::placeholders::_1));
+        
+        RCLCPP_INFO(this->get_logger(), "RESPLE configured successfully");
+        return rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn::SUCCESS;
+    }
+    
+    rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn
+    on_activate(const rclcpp_lifecycle::State&)
+    {
+        RCLCPP_INFO(this->get_logger(), "Activating RESPLE...");
+        
+        // Activate publishers
+        pub_est->on_activate();
+        pub_start_time->on_activate();
+        pub_pose->on_activate();
+        pub_cur_scan->on_activate();
+        
+        // Setup subscriptions
         rclcpp::SubscriptionOptions sensor_sub_opt;
         sensor_sub_opt.callback_group = sensor_cb_group;
-        
-        // QoS profiles for different topics
         auto imu_qos = rclcpp::SensorDataQoS().keep_last(200).best_effort();
         auto lidar_qos = rclcpp::SensorDataQoS().keep_last(100).best_effort();
         
@@ -64,11 +137,7 @@ public:
             sub_imu = this->create_subscription<sensor_msgs::msg::Imu>(
                 imu_type, imu_qos, std::bind(&RESPLE::getImuCallback, this, std::placeholders::_1), sensor_sub_opt);
         }
-        pub_est = this->create_publisher<estimate_msgs::msg::Estimate>("est_window", rclcpp::QoS(50).reliable());
-        pub_start_time = this->create_publisher<std_msgs::msg::Int64>("start_time", rclcpp::QoS(50).reliable());
-        pub_pose = this->create_publisher<geometry_msgs::msg::PoseStamped>("pose", rclcpp::QoS(50).reliable());
-        pub_cur_scan = this->create_publisher<sensor_msgs::msg::PointCloud2>("current_scan", rclcpp::QoS(2).reliable());
-        br = std::make_shared<tf2_ros::TransformBroadcaster>(*this);
+        
         auto lidar_names = this->declare_parameter<std::vector<std::string>>("lidars", std::vector<std::string>());
         assert(this->get_parameter("lidars", lidar_names));
         if (lidar_names.empty()) {
@@ -82,6 +151,7 @@ public:
                 lidars_data.emplace(std::piecewise_construct, std::make_tuple(lidar.type), std::make_tuple());
             }
         }
+        
         for (const auto& [lidar_name, lidar] : lidars) {
             if (!lidar.type.compare("Ouster")) {
                 sub_ouster = this->create_subscription<sensor_msgs::msg::PointCloud2>(
@@ -103,6 +173,83 @@ public:
                         lidar.topic, lidar_qos, std::bind(&RESPLE::livoxMid360BoxiCallback, this, std::placeholders::_1), sensor_sub_opt);
             }
         }
+        
+        // Start processing thread
+        processing_active_ = true;
+        processing_thread_ = std::thread(&RESPLE::processData, this);
+        
+        RCLCPP_INFO(this->get_logger(), "RESPLE activated successfully");
+        return rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn::SUCCESS;
+    }
+    
+    rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn
+    on_deactivate(const rclcpp_lifecycle::State&)
+    {
+        RCLCPP_INFO(this->get_logger(), "Deactivating RESPLE...");
+        
+        // Stop processing thread
+        processing_active_ = false;
+        if (processing_thread_.joinable()) {
+            processing_thread_.join();
+        }
+        
+        // Deactivate publishers
+        pub_est->on_deactivate();
+        pub_start_time->on_deactivate();
+        pub_pose->on_deactivate();
+        pub_cur_scan->on_deactivate();
+        
+        // Reset subscriptions
+        sub_imu.reset();
+        sub_ouster.reset();
+        sub_livox.reset();
+        sub_livox2.reset();
+        sub_livox_avia.reset();
+        sub_hesai.reset();
+        sub_livox_mid360_boxi.reset();
+        
+        RCLCPP_INFO(this->get_logger(), "RESPLE deactivated successfully");
+        return rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn::SUCCESS;
+    }
+    
+    rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn
+    on_cleanup(const rclcpp_lifecycle::State&)
+    {
+        RCLCPP_INFO(this->get_logger(), "Cleaning up RESPLE...");
+        
+        // Clear buffers and data structures
+        lidars.clear();
+        lidars_data.clear();
+        imu_buff.clear();
+        imu_meas.clear();
+        pt_meas.clear();
+        pc_world.clear();
+        accum_nearest_points.clear();
+        
+        // Reset publishers
+        pub_est.reset();
+        pub_start_time.reset();
+        pub_pose.reset();
+        pub_cur_scan.reset();
+        br.reset();
+        
+        RCLCPP_INFO(this->get_logger(), "RESPLE cleaned up successfully");
+        return rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn::SUCCESS;
+    }
+    
+    rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn
+    on_shutdown(const rclcpp_lifecycle::State&)
+    {
+        RCLCPP_INFO(this->get_logger(), "Shutting down RESPLE...");
+        
+        // Ensure processing thread is stopped
+        processing_active_ = false;
+        if (processing_thread_.joinable()) {
+            processing_thread_.join();
+        }
+        
+        RCLCPP_INFO(this->get_logger(), "RESPLE shutdown complete");
+        return rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn::SUCCESS;
     }
 
     void processData()
@@ -110,7 +257,7 @@ public:
         rclcpp::Rate rate(20);
         int64_t max_spl_knots = 0;
         int64_t t_last_map_upd = 0;
-        while (true) {
+        while (processing_active_ && rclcpp::ok()) {
             for (auto& [lidar_name, lidar_data] : lidars_data) {
                 while (!lidar_data.t_buff.empty()) {
                     pc_frame_reusable_->clear();
@@ -150,14 +297,20 @@ public:
                 }
             }
             if(!initialization()) {
-                rate.sleep();
+                if (rclcpp::ok()) {
+                    rate.sleep();
+                }
                 continue;
             }
             while (collectMeasurements()) {
+                // Phase 4: Track computation time
+                auto frame_start = std::chrono::high_resolution_clock::now();
+                
                 int64_t max_time_ns = pt_meas.back().time_ns;
                 if (if_lidar_only) {
                     estimator_lo.propRCP(max_time_ns);
                     estimator_lo.updateIEKFLiDAR(pt_meas, &ikdtree, param.nn_thresh, param.coeff_cov, num_threads_, num_match_points_);
+                    total_iekf_iterations_ += estimator_lo.n_iter;
                 } else {
                     if (!imu_meas.empty()) {
                         max_time_ns = std::max(imu_meas.back().time_ns, max_time_ns);
@@ -167,6 +320,7 @@ public:
                     }
                     estimator_lio.propRCP(max_time_ns);
                     estimator_lio.updateIEKFLiDARInertial(pt_meas, &ikdtree, param.nn_thresh, imu_meas, gravity, param.cov_acc, param.cov_gyro, param.coeff_cov, num_threads_, num_match_points_);
+                    total_iekf_iterations_ += estimator_lio.n_iter;
                 }
                 #pragma omp parallel for num_threads(num_threads_)
                 for (size_t i = 0; i < pt_meas.size(); i++) {
@@ -210,6 +364,18 @@ public:
                     accum_nearest_points.clear();
                     t_last_map_upd = max_time_ns;
                 }
+                
+                // Phase 4: Update diagnostic metrics
+                auto frame_end = std::chrono::high_resolution_clock::now();
+                auto frame_duration = std::chrono::duration_cast<std::chrono::microseconds>(frame_end - frame_start);
+                total_computation_time_ms_ += frame_duration.count() / 1000.0;
+                frame_count_++;
+                
+                // Update diagnostics at 1 Hz
+                if ((this->now() - last_process_time_).seconds() >= 1.0) {
+                    diagnostics_.force_update();
+                    last_process_time_ = this->now();
+                }
             }
         }
     }
@@ -225,6 +391,22 @@ private:
     int num_threads_;
     int num_match_points_;
     
+    // Phase 4: Diagnostics
+    diagnostic_updater::Updater diagnostics_;
+    rclcpp::Time last_process_time_;
+    size_t frame_count_;
+    double total_computation_time_ms_;
+    size_t total_iekf_iterations_;
+    
+    // Phase 4: Lifecycle management
+    std::atomic<bool> processing_active_;
+    std::thread processing_thread_;
+    
+    // Phase 4: SaveMap action server
+    using SaveMapAction = estimate_msgs::action::SaveMap;
+    using GoalHandleSaveMap = rclcpp_action::ServerGoalHandle<SaveMapAction>;
+    rclcpp_action::Server<SaveMapAction>::SharedPtr save_map_action_server_;
+    
     // Pre-allocated reusable buffers (Phase 3 - avoid repeated heap allocations)
     pcl::PointCloud<pcl::PointXYZINormal>::Ptr pc_frame_reusable_;
     pcl::PointCloud<pcl::PointXYZI>::Ptr laser_cloud_world_reusable_;
@@ -236,10 +418,10 @@ private:
     rclcpp::Subscription<livox_interfaces::msg::CustomMsg>::SharedPtr sub_livox_avia;
     rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr sub_hesai;
     rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr sub_livox_mid360_boxi;
-    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub_cur_scan;
-    rclcpp::Publisher<estimate_msgs::msg::Estimate>::SharedPtr pub_est;
-    rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr pub_pose;
-    rclcpp::Publisher<std_msgs::msg::Int64>::SharedPtr pub_start_time;
+    rclcpp_lifecycle::LifecyclePublisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub_cur_scan;
+    rclcpp_lifecycle::LifecyclePublisher<estimate_msgs::msg::Estimate>::SharedPtr pub_est;
+    rclcpp_lifecycle::LifecyclePublisher<geometry_msgs::msg::PoseStamped>::SharedPtr pub_pose;
+    rclcpp_lifecycle::LifecyclePublisher<std_msgs::msg::Int64>::SharedPtr pub_start_time;
     std::shared_ptr<tf2_ros::TransformBroadcaster> br;
     const std::string frame_id = "base_link";
     const std::string odom_id = "odom";
@@ -297,13 +479,115 @@ private:
 
     const std::string baselink_frame = "base_link";
     const std::string odom_frame = "odom";
+    
+    // Phase 4: SaveMap action server handlers
+    rclcpp_action::GoalResponse handleSaveMapGoal(
+        const rclcpp_action::GoalUUID & uuid,
+        std::shared_ptr<const SaveMapAction::Goal> goal)
+    {
+        (void)uuid;
+        RCLCPP_INFO(this->get_logger(), "Received save map request: %s", goal->filename.c_str());
+        return rclcpp_action::GoalResponse::ACCEPT_AND_EXECUTE;
+    }
+    
+    rclcpp_action::CancelResponse handleSaveMapCancel(
+        const std::shared_ptr<GoalHandleSaveMap> goal_handle)
+    {
+        (void)goal_handle;
+        RCLCPP_INFO(this->get_logger(), "Received request to cancel save map");
+        return rclcpp_action::CancelResponse::ACCEPT;
+    }
+    
+    void handleSaveMapAccepted(const std::shared_ptr<GoalHandleSaveMap> goal_handle)
+    {
+        // Execute in separate thread to not block action server
+        std::thread{std::bind(&RESPLE::executeSaveMap, this, std::placeholders::_1), goal_handle}.detach();
+    }
+    
+    void executeSaveMap(const std::shared_ptr<GoalHandleSaveMap> goal_handle)
+    {
+        RCLCPP_INFO(this->get_logger(), "Executing save map action...");
+        
+        const auto goal = goal_handle->get_goal();
+        auto feedback = std::make_shared<SaveMapAction::Feedback>();
+        auto result = std::make_shared<SaveMapAction::Result>();
+        
+        try {
+            // Get all points from ikd-tree
+            feedback->status = "Extracting points from map...";
+            feedback->progress = 10.0;
+            goal_handle->publish_feedback(feedback);
+            
+            pcl::PointCloud<pcl::PointXYZINormal>::Ptr map_cloud(new pcl::PointCloud<pcl::PointXYZINormal>());
+            ikdtree.flatten(ikdtree.Root_Node, ikdtree.PCL_Storage, NOT_RECORD);
+            map_cloud->points = ikdtree.PCL_Storage;
+            map_cloud->width = map_cloud->points.size();
+            map_cloud->height = 1;
+            map_cloud->is_dense = false;
+            
+            // Check for cancellation
+            if (goal_handle->is_canceling()) {
+                result->success = false;
+                result->message = "Save map operation was cancelled";
+                result->points_saved = 0;
+                goal_handle->canceled(result);
+                RCLCPP_INFO(this->get_logger(), "Save map cancelled");
+                return;
+            }
+            
+            feedback->status = "Writing map to file...";
+            feedback->progress = 50.0;
+            goal_handle->publish_feedback(feedback);
+            
+            // Save to PCD file
+            if (pcl::io::savePCDFileBinary(goal->filename, *map_cloud) == -1) {
+                result->success = false;
+                result->message = "Failed to write PCD file: " + goal->filename;
+                result->points_saved = 0;
+                goal_handle->abort(result);
+                RCLCPP_ERROR(this->get_logger(), "%s", result->message.c_str());
+                return;
+            }
+            
+            feedback->status = "Map saved successfully";
+            feedback->progress = 100.0;
+            goal_handle->publish_feedback(feedback);
+            
+            result->success = true;
+            result->message = "Map saved successfully to " + goal->filename;
+            result->points_saved = map_cloud->points.size();
+            goal_handle->succeed(result);
+            
+            RCLCPP_INFO(this->get_logger(), "Saved %u points to %s", 
+                       result->points_saved, goal->filename.c_str());
+                       
+        } catch (const std::exception& e) {
+            result->success = false;
+            result->message = std::string("Exception during save: ") + e.what();
+            result->points_saved = 0;
+            goal_handle->abort(result);
+            RCLCPP_ERROR(this->get_logger(), "%s", result->message.c_str());
+        }
+    }
 
     void readParameters()
     {
         ds_lm_voxel = CommonUtils::readParam<float>(*this, "ds_lm_voxel");
+        
+        // Phase 4: Validate ds_scan_voxel parameter
         float ds_scan_voxel = CommonUtils::readParam<float>(*this, "ds_scan_voxel");
+        if (ds_scan_voxel < 0.01 || ds_scan_voxel > 1.0) {
+            RCLCPP_WARN(this->get_logger(), 
+                "ds_scan_voxel value %.3f outside recommended range [0.01, 1.0]", ds_scan_voxel);
+        }
         ds_filter_body.setLeafSize(ds_scan_voxel, ds_scan_voxel, ds_scan_voxel);
+        
+        // Phase 4: Validate nn_thresh parameter
         param.nn_thresh = CommonUtils::readParam<double>(*this, "nn_thresh");
+        if (param.nn_thresh < 0.1 || param.nn_thresh > 5.0) {
+            RCLCPP_WARN(this->get_logger(), 
+                "nn_thresh value %.3f outside recommended range [0.1, 5.0]", param.nn_thresh);
+        }
         if_lidar_only = CommonUtils::readParam<bool>(*this, "if_lidar_only");
         if (!if_lidar_only) {
             acc_ratio = CommonUtils::readParam<bool>(*this, "acc_ratio");
@@ -382,6 +666,56 @@ private:
         m_buff.lock();
         imu_int_buff.push_back(imu_msg);
         m_buff.unlock();
+    }
+    
+    // Phase 4: Diagnostic updater callback
+    void updateDiagnostics(diagnostic_updater::DiagnosticStatusWrapper& stat)
+    {
+        // Calculate processing rate
+        double time_elapsed = (this->now() - last_process_time_).seconds();
+        double processing_rate = (time_elapsed > 0) ? frame_count_ / time_elapsed : 0.0;
+        double avg_computation_time = (frame_count_ > 0) ? total_computation_time_ms_ / frame_count_ : 0.0;
+        double avg_iekf_iters = (frame_count_ > 0) ? static_cast<double>(total_iekf_iterations_) / frame_count_ : 0.0;
+        
+        // Determine system health
+        const double expected_rate = 20.0;  // Target: 20 Hz
+        const double warn_threshold = 0.7 * expected_rate;  // 14 Hz
+        const double error_threshold = 0.5 * expected_rate;  // 10 Hz
+        
+        if (frame_count_ == 0) {
+            stat.summary(diagnostic_msgs::msg::DiagnosticStatus::WARN, "No frames processed yet");
+        } else if (processing_rate < error_threshold) {
+            stat.summary(diagnostic_msgs::msg::DiagnosticStatus::ERROR, 
+                        "Processing rate critically low");
+        } else if (processing_rate < warn_threshold) {
+            stat.summary(diagnostic_msgs::msg::DiagnosticStatus::WARN, 
+                        "Processing rate below target");
+        } else {
+            stat.summary(diagnostic_msgs::msg::DiagnosticStatus::OK, "System healthy");
+        }
+        
+        // Add detailed metrics
+        stat.add("Processing Rate (Hz)", processing_rate);
+        stat.add("Target Rate (Hz)", expected_rate);
+        stat.add("Frames Processed", static_cast<int>(frame_count_));
+        stat.add("Avg Computation Time (ms)", avg_computation_time);
+        stat.add("Avg IEKF Iterations", avg_iekf_iters);
+        stat.add("Num Threads", num_threads_);
+        stat.add("Num Match Points", num_match_points_);
+        
+        // Buffer sizes
+        size_t total_lidar_buffer = 0;
+        for (const auto& [name, data] : lidars_data) {
+            total_lidar_buffer += data.pc_buff.size();
+        }
+        stat.add("LiDAR Buffer Size", static_cast<int>(total_lidar_buffer));
+        stat.add("IMU Buffer Size", static_cast<int>(imu_buff.size()));
+        stat.add("Point Meas Buffer Size", static_cast<int>(pt_meas.size()));
+        
+        // Reset counters for next period
+        frame_count_ = 0;
+        total_computation_time_ms_ = 0.0;
+        total_iekf_iterations_ = 0;
     }
 
     template<typename T>
@@ -920,20 +1254,37 @@ private:
 int main(int argc, char *argv[])
 {
     rclcpp::init(argc, argv);
-    // Allow running as a standalone node (non-composed) for convenience
+    
+    // Phase 4: Lifecycle node initialization
     rclcpp::NodeOptions options;
     auto node = std::make_shared<RESPLE>(options);
-    RCLCPP_INFO_STREAM(node->get_logger(), "RESPLE starts!");
+    RCLCPP_INFO_STREAM(node->get_logger(), "RESPLE LifecycleNode created");
 
-    // Start the background data-processing thread
-    std::thread opt{&RESPLE::processData, node.get()};
+    // Transition to configured state
+    node->configure();
+    RCLCPP_INFO_STREAM(node->get_logger(), "RESPLE configured");
+    
+    // Transition to active state (starts processing)
+    node->activate();
+    RCLCPP_INFO_STREAM(node->get_logger(), "RESPLE activated - processing started");
 
     rclcpp::executors::MultiThreadedExecutor exec;
-    exec.add_node(node);
+    exec.add_node(node->get_node_base_interface());
     exec.spin();
 
-    if (opt.joinable()) opt.join();
-    exec.remove_node(node);
+    // Cleanup on shutdown (only if context still valid)
+    if (rclcpp::ok()) {
+        RCLCPP_INFO(node->get_logger(), "Gracefully shutting down RESPLE...");
+        node->deactivate();
+        node->cleanup();
+        node->shutdown();
+    } else {
+        // Context already shut down (Ctrl+C), just stop processing
+        RCLCPP_WARN(node->get_logger(), "Context invalid, forcing shutdown...");
+        // Manually trigger deactivation to stop thread
+        node->on_deactivate(node->get_current_state());
+    }
+    exec.remove_node(node->get_node_base_interface());
     rclcpp::shutdown();
     return 0;
 }
